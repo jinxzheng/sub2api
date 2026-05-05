@@ -181,6 +181,55 @@ func TestResponsesToAnthropic_TextOnly(t *testing.T) {
 	assert.Equal(t, 5, anth.Usage.OutputTokens)
 }
 
+func TestResponsesToAnthropic_CachedTokensUseAnthropicInputSemantics(t *testing.T) {
+	resp := &ResponsesResponse{
+		ID:     "resp_cached",
+		Model:  "gpt-5.2",
+		Status: "completed",
+		Output: []ResponsesOutput{
+			{
+				Type: "message",
+				Content: []ResponsesContentPart{
+					{Type: "output_text", Text: "Cached response"},
+				},
+			},
+		},
+		Usage: &ResponsesUsage{
+			InputTokens:  54006,
+			OutputTokens: 123,
+			TotalTokens:  54129,
+			InputTokensDetails: &ResponsesInputTokensDetails{
+				CachedTokens: 50688,
+			},
+		},
+	}
+
+	anth := ResponsesToAnthropic(resp, "claude-sonnet-4-5-20250929")
+	assert.Equal(t, 3318, anth.Usage.InputTokens)
+	assert.Equal(t, 50688, anth.Usage.CacheReadInputTokens)
+	assert.Equal(t, 123, anth.Usage.OutputTokens)
+}
+
+func TestResponsesToAnthropic_CachedTokensClampInputTokens(t *testing.T) {
+	resp := &ResponsesResponse{
+		ID:     "resp_cached_clamp",
+		Model:  "gpt-5.2",
+		Status: "completed",
+		Usage: &ResponsesUsage{
+			InputTokens:  100,
+			OutputTokens: 5,
+			InputTokensDetails: &ResponsesInputTokensDetails{
+				CachedTokens: 150,
+			},
+		},
+	}
+
+	anth := ResponsesToAnthropic(resp, "claude-sonnet-4-5-20250929")
+	assert.Equal(t, 0, anth.Usage.InputTokens)
+	assert.Equal(t, 150, anth.Usage.CacheReadInputTokens)
+	assert.Equal(t, 5, anth.Usage.OutputTokens)
+}
+
 func TestResponsesToAnthropic_ToolUse(t *testing.T) {
 	resp := &ResponsesResponse{
 		ID:     "resp_456",
@@ -209,6 +258,48 @@ func TestResponsesToAnthropic_ToolUse(t *testing.T) {
 	assert.Equal(t, "tool_use", anth.Content[1].Type)
 	assert.Equal(t, "call_1", anth.Content[1].ID)
 	assert.Equal(t, "get_weather", anth.Content[1].Name)
+	assert.JSONEq(t, `{"city":"NYC"}`, string(anth.Content[1].Input))
+}
+
+func TestResponsesToAnthropic_ReadToolDropsEmptyPages(t *testing.T) {
+	resp := &ResponsesResponse{
+		ID:     "resp_read",
+		Model:  "gpt-5.5",
+		Status: "completed",
+		Output: []ResponsesOutput{
+			{
+				Type:      "function_call",
+				CallID:    "call_read",
+				Name:      "Read",
+				Arguments: `{"file_path":"/tmp/demo.py","limit":2000,"offset":0,"pages":""}`,
+			},
+		},
+	}
+
+	anth := ResponsesToAnthropic(resp, "claude-opus-4-6")
+	require.Len(t, anth.Content, 1)
+	assert.Equal(t, "tool_use", anth.Content[0].Type)
+	assert.JSONEq(t, `{"file_path":"/tmp/demo.py","limit":2000,"offset":0}`, string(anth.Content[0].Input))
+}
+
+func TestResponsesToAnthropic_PreservesEmptyStringsForOtherTools(t *testing.T) {
+	resp := &ResponsesResponse{
+		ID:     "resp_other",
+		Model:  "gpt-5.5",
+		Status: "completed",
+		Output: []ResponsesOutput{
+			{
+				Type:      "function_call",
+				CallID:    "call_other",
+				Name:      "Search",
+				Arguments: `{"query":""}`,
+			},
+		},
+	}
+
+	anth := ResponsesToAnthropic(resp, "claude-opus-4-6")
+	require.Len(t, anth.Content, 1)
+	assert.JSONEq(t, `{"query":""}`, string(anth.Content[0].Input))
 }
 
 func TestResponsesToAnthropic_Reasoning(t *testing.T) {
@@ -343,6 +434,75 @@ func TestStreamingTextOnly(t *testing.T) {
 	assert.Equal(t, "message_stop", events[1].Type)
 }
 
+func TestResponsesEventToAnthropicEvents_ResponseDone(t *testing.T) {
+	state := NewResponsesEventToAnthropicState()
+	state.Model = "gpt-4o"
+
+	events := ResponsesEventToAnthropicEvents(&ResponsesStreamEvent{
+		Type: "response.done",
+		Response: &ResponsesResponse{
+			Status: "completed",
+			Usage:  &ResponsesUsage{InputTokens: 12, OutputTokens: 4},
+		},
+	}, state)
+	require.Len(t, events, 2)
+	assert.Equal(t, "message_delta", events[0].Type)
+	assert.Equal(t, "end_turn", events[0].Delta.StopReason)
+	assert.Equal(t, 12, events[0].Usage.InputTokens)
+	assert.Equal(t, 4, events[0].Usage.OutputTokens)
+	assert.Equal(t, "message_stop", events[1].Type)
+	assert.Nil(t, FinalizeResponsesAnthropicStream(state))
+}
+
+func TestResponsesEventToAnthropicEvents_ResponseDoneIncomplete(t *testing.T) {
+	state := NewResponsesEventToAnthropicState()
+	state.Model = "gpt-4o"
+
+	events := ResponsesEventToAnthropicEvents(&ResponsesStreamEvent{
+		Type: "response.done",
+		Response: &ResponsesResponse{
+			Status:            "incomplete",
+			IncompleteDetails: &ResponsesIncompleteDetails{Reason: "max_output_tokens"},
+			Usage:             &ResponsesUsage{InputTokens: 12, OutputTokens: 4},
+		},
+	}, state)
+	require.Len(t, events, 2)
+	assert.Equal(t, "message_delta", events[0].Type)
+	assert.Equal(t, "max_tokens", events[0].Delta.StopReason)
+	assert.Equal(t, "message_stop", events[1].Type)
+	assert.Nil(t, FinalizeResponsesAnthropicStream(state))
+}
+
+func TestStreamingCachedTokensUseAnthropicInputSemantics(t *testing.T) {
+	state := NewResponsesEventToAnthropicState()
+	ResponsesEventToAnthropicEvents(&ResponsesStreamEvent{
+		Type:     "response.created",
+		Response: &ResponsesResponse{ID: "resp_cached_stream", Model: "gpt-5.2"},
+	}, state)
+
+	events := ResponsesEventToAnthropicEvents(&ResponsesStreamEvent{
+		Type: "response.completed",
+		Response: &ResponsesResponse{
+			Status: "completed",
+			Usage: &ResponsesUsage{
+				InputTokens:  54006,
+				OutputTokens: 123,
+				TotalTokens:  54129,
+				InputTokensDetails: &ResponsesInputTokensDetails{
+					CachedTokens: 50688,
+				},
+			},
+		},
+	}, state)
+
+	require.Len(t, events, 2)
+	assert.Equal(t, "message_delta", events[0].Type)
+	assert.Equal(t, 3318, events[0].Usage.InputTokens)
+	assert.Equal(t, 50688, events[0].Usage.CacheReadInputTokens)
+	assert.Equal(t, 123, events[0].Usage.OutputTokens)
+	assert.Equal(t, "message_stop", events[1].Type)
+}
+
 func TestStreamingToolCall(t *testing.T) {
 	state := NewResponsesEventToAnthropicState()
 
@@ -391,6 +551,41 @@ func TestStreamingToolCall(t *testing.T) {
 	}, state)
 	require.Len(t, events, 2)
 	assert.Equal(t, "tool_use", events[0].Delta.StopReason)
+}
+
+func TestStreamingReadToolDropsEmptyPages(t *testing.T) {
+	state := NewResponsesEventToAnthropicState()
+
+	ResponsesEventToAnthropicEvents(&ResponsesStreamEvent{
+		Type:     "response.created",
+		Response: &ResponsesResponse{ID: "resp_read_stream", Model: "gpt-5.5"},
+	}, state)
+
+	events := ResponsesEventToAnthropicEvents(&ResponsesStreamEvent{
+		Type:        "response.output_item.added",
+		OutputIndex: 0,
+		Item:        &ResponsesOutput{Type: "function_call", CallID: "call_read", Name: "Read"},
+	}, state)
+	require.Len(t, events, 1)
+	assert.Equal(t, "content_block_start", events[0].Type)
+
+	events = ResponsesEventToAnthropicEvents(&ResponsesStreamEvent{
+		Type:        "response.function_call_arguments.delta",
+		OutputIndex: 0,
+		Delta:       `{"file_path":"/tmp/demo.py","limit":2000,"offset":0,"pages":""}`,
+	}, state)
+	assert.Len(t, events, 0)
+
+	events = ResponsesEventToAnthropicEvents(&ResponsesStreamEvent{
+		Type:        "response.function_call_arguments.done",
+		OutputIndex: 0,
+		Arguments:   `{"file_path":"/tmp/demo.py","limit":2000,"offset":0,"pages":""}`,
+	}, state)
+	require.Len(t, events, 2)
+	assert.Equal(t, "content_block_delta", events[0].Type)
+	assert.Equal(t, "input_json_delta", events[0].Delta.Type)
+	assert.JSONEq(t, `{"file_path":"/tmp/demo.py","limit":2000,"offset":0}`, events[0].Delta.PartialJSON)
+	assert.Equal(t, "content_block_stop", events[1].Type)
 }
 
 func TestStreamingReasoning(t *testing.T) {
@@ -632,8 +827,8 @@ func TestAnthropicToResponses_ThinkingEnabled(t *testing.T) {
 	resp, err := AnthropicToResponses(req)
 	require.NoError(t, err)
 	require.NotNil(t, resp.Reasoning)
-	// thinking.type is ignored for effort; default xhigh applies.
-	assert.Equal(t, "xhigh", resp.Reasoning.Effort)
+	// thinking.type is ignored for effort; default high applies.
+	assert.Equal(t, "high", resp.Reasoning.Effort)
 	assert.Equal(t, "auto", resp.Reasoning.Summary)
 	assert.Contains(t, resp.Include, "reasoning.encrypted_content")
 	assert.NotContains(t, resp.Include, "reasoning.summary")
@@ -650,8 +845,8 @@ func TestAnthropicToResponses_ThinkingAdaptive(t *testing.T) {
 	resp, err := AnthropicToResponses(req)
 	require.NoError(t, err)
 	require.NotNil(t, resp.Reasoning)
-	// thinking.type is ignored for effort; default xhigh applies.
-	assert.Equal(t, "xhigh", resp.Reasoning.Effort)
+	// thinking.type is ignored for effort; default high applies.
+	assert.Equal(t, "high", resp.Reasoning.Effort)
 	assert.Equal(t, "auto", resp.Reasoning.Summary)
 	assert.NotContains(t, resp.Include, "reasoning.summary")
 }
@@ -666,9 +861,9 @@ func TestAnthropicToResponses_ThinkingDisabled(t *testing.T) {
 
 	resp, err := AnthropicToResponses(req)
 	require.NoError(t, err)
-	// Default effort applies (high → xhigh) even when thinking is disabled.
+	// Default effort applies (high → high) even when thinking is disabled.
 	require.NotNil(t, resp.Reasoning)
-	assert.Equal(t, "xhigh", resp.Reasoning.Effort)
+	assert.Equal(t, "high", resp.Reasoning.Effort)
 }
 
 func TestAnthropicToResponses_NoThinking(t *testing.T) {
@@ -680,9 +875,9 @@ func TestAnthropicToResponses_NoThinking(t *testing.T) {
 
 	resp, err := AnthropicToResponses(req)
 	require.NoError(t, err)
-	// Default effort applies (high → xhigh) when no thinking/output_config is set.
+	// Default effort applies (high → high) when no thinking/output_config is set.
 	require.NotNil(t, resp.Reasoning)
-	assert.Equal(t, "xhigh", resp.Reasoning.Effort)
+	assert.Equal(t, "high", resp.Reasoning.Effort)
 }
 
 // ---------------------------------------------------------------------------
@@ -690,7 +885,7 @@ func TestAnthropicToResponses_NoThinking(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAnthropicToResponses_OutputConfigOverridesDefault(t *testing.T) {
-	// Default is xhigh, but output_config.effort="low" overrides. low→low after mapping.
+	// Default is high, but output_config.effort="low" overrides. low→low after mapping.
 	req := &AnthropicRequest{
 		Model:        "gpt-5.2",
 		MaxTokens:    1024,
@@ -708,7 +903,7 @@ func TestAnthropicToResponses_OutputConfigOverridesDefault(t *testing.T) {
 
 func TestAnthropicToResponses_OutputConfigWithoutThinking(t *testing.T) {
 	// No thinking field, but output_config.effort="medium" → creates reasoning.
-	// medium→high after mapping.
+	// medium→medium after 1:1 mapping.
 	req := &AnthropicRequest{
 		Model:        "gpt-5.2",
 		MaxTokens:    1024,
@@ -719,12 +914,12 @@ func TestAnthropicToResponses_OutputConfigWithoutThinking(t *testing.T) {
 	resp, err := AnthropicToResponses(req)
 	require.NoError(t, err)
 	require.NotNil(t, resp.Reasoning)
-	assert.Equal(t, "high", resp.Reasoning.Effort)
+	assert.Equal(t, "medium", resp.Reasoning.Effort)
 	assert.Equal(t, "auto", resp.Reasoning.Summary)
 }
 
 func TestAnthropicToResponses_OutputConfigHigh(t *testing.T) {
-	// output_config.effort="high" → mapped to "xhigh".
+	// output_config.effort="high" → mapped to "high" (1:1, both sides' default).
 	req := &AnthropicRequest{
 		Model:        "gpt-5.2",
 		MaxTokens:    1024,
@@ -735,12 +930,28 @@ func TestAnthropicToResponses_OutputConfigHigh(t *testing.T) {
 	resp, err := AnthropicToResponses(req)
 	require.NoError(t, err)
 	require.NotNil(t, resp.Reasoning)
+	assert.Equal(t, "high", resp.Reasoning.Effort)
+	assert.Equal(t, "auto", resp.Reasoning.Summary)
+}
+
+func TestAnthropicToResponses_OutputConfigMax(t *testing.T) {
+	// output_config.effort="max" → mapped to OpenAI's highest supported level "xhigh".
+	req := &AnthropicRequest{
+		Model:        "gpt-5.2",
+		MaxTokens:    1024,
+		Messages:     []AnthropicMessage{{Role: "user", Content: json.RawMessage(`"Hello"`)}},
+		OutputConfig: &AnthropicOutputConfig{Effort: "max"},
+	}
+
+	resp, err := AnthropicToResponses(req)
+	require.NoError(t, err)
+	require.NotNil(t, resp.Reasoning)
 	assert.Equal(t, "xhigh", resp.Reasoning.Effort)
 	assert.Equal(t, "auto", resp.Reasoning.Summary)
 }
 
 func TestAnthropicToResponses_NoOutputConfig(t *testing.T) {
-	// No output_config → default xhigh regardless of thinking.type.
+	// No output_config → default high regardless of thinking.type.
 	req := &AnthropicRequest{
 		Model:     "gpt-5.2",
 		MaxTokens: 1024,
@@ -751,11 +962,11 @@ func TestAnthropicToResponses_NoOutputConfig(t *testing.T) {
 	resp, err := AnthropicToResponses(req)
 	require.NoError(t, err)
 	require.NotNil(t, resp.Reasoning)
-	assert.Equal(t, "xhigh", resp.Reasoning.Effort)
+	assert.Equal(t, "high", resp.Reasoning.Effort)
 }
 
 func TestAnthropicToResponses_OutputConfigWithoutEffort(t *testing.T) {
-	// output_config present but effort empty (e.g. only format set) → default xhigh.
+	// output_config present but effort empty (e.g. only format set) → default high.
 	req := &AnthropicRequest{
 		Model:        "gpt-5.2",
 		MaxTokens:    1024,
@@ -766,7 +977,7 @@ func TestAnthropicToResponses_OutputConfigWithoutEffort(t *testing.T) {
 	resp, err := AnthropicToResponses(req)
 	require.NoError(t, err)
 	require.NotNil(t, resp.Reasoning)
-	assert.Equal(t, "xhigh", resp.Reasoning.Effort)
+	assert.Equal(t, "high", resp.Reasoning.Effort)
 }
 
 // ---------------------------------------------------------------------------
@@ -819,9 +1030,40 @@ func TestAnthropicToResponses_ToolChoiceSpecific(t *testing.T) {
 	var tc map[string]any
 	require.NoError(t, json.Unmarshal(resp.ToolChoice, &tc))
 	assert.Equal(t, "function", tc["type"])
-	fn, ok := tc["function"].(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, "get_weather", fn["name"])
+	assert.Equal(t, "get_weather", tc["name"])
+	assert.NotContains(t, tc, "function")
+}
+
+func TestResponsesToAnthropicRequest_ToolChoiceFunctionName(t *testing.T) {
+	req := &ResponsesRequest{
+		Model:      "gpt-5.2",
+		Input:      json.RawMessage(`[{"role":"user","content":"Hello"}]`),
+		ToolChoice: json.RawMessage(`{"type":"function","name":"get_weather"}`),
+	}
+
+	resp, err := ResponsesToAnthropicRequest(req)
+	require.NoError(t, err)
+
+	var tc map[string]string
+	require.NoError(t, json.Unmarshal(resp.ToolChoice, &tc))
+	assert.Equal(t, "tool", tc["type"])
+	assert.Equal(t, "get_weather", tc["name"])
+}
+
+func TestResponsesToAnthropicRequest_ToolChoiceLegacyFunctionName(t *testing.T) {
+	req := &ResponsesRequest{
+		Model:      "gpt-5.2",
+		Input:      json.RawMessage(`[{"role":"user","content":"Hello"}]`),
+		ToolChoice: json.RawMessage(`{"type":"function","function":{"name":"get_weather"}}`),
+	}
+
+	resp, err := ResponsesToAnthropicRequest(req)
+	require.NoError(t, err)
+
+	var tc map[string]string
+	require.NoError(t, json.Unmarshal(resp.ToolChoice, &tc))
+	assert.Equal(t, "tool", tc["type"])
+	assert.Equal(t, "get_weather", tc["name"])
 }
 
 // ---------------------------------------------------------------------------
